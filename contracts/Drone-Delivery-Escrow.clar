@@ -14,6 +14,11 @@
 (define-constant ERR-ALREADY-RELEASED (err u106))
 (define-constant ERR-INVALID-STATUS (err u107))
 (define-constant ERR-DISPUTE-EXISTS (err u108))
+(define-constant ERR-OUTSIDE-GEOFENCE (err u109))
+(define-constant ERR-INVALID-COORDINATES (err u110))
+(define-constant ERR-ROUTE-NOT-FOUND (err u111))
+(define-constant ERR-TRACKING-INACTIVE (err u112))
+(define-constant ERR-GEOFENCE-NOT-SET (err u113))
 
 (define-constant ESCROW-TIMEOUT u144)
 (define-constant DISPUTE-TIMEOUT u288)
@@ -26,6 +31,8 @@
 
 (define-data-var escrow-counter uint u0)
 (define-data-var total-escrowed uint u0)
+(define-data-var total-waypoints uint u0)
+(define-data-var active-deliveries uint u0)
 
 (define-map escrows
   uint
@@ -68,6 +75,54 @@
     verified: bool,
     total-deliveries: uint,
     success-rate: uint
+  }
+)
+
+(define-map delivery-routes
+  uint
+  {
+    start-lat: int,
+    start-lon: int,
+    end-lat: int,
+    end-lon: int,
+    estimated-distance: uint,
+    estimated-time: uint,
+    tracking-active: bool,
+    waypoint-count: uint
+  }
+)
+
+(define-map tracking-waypoints
+  {escrow-id: uint, waypoint-id: uint}
+  {
+    latitude: int,
+    longitude: int,
+    altitude: uint,
+    timestamp: uint,
+    speed: uint,
+    battery-level: uint
+  }
+)
+
+(define-map geofence-zones
+  uint
+  {
+    center-lat: int,
+    center-lon: int,
+    radius-meters: uint,
+    zone-type: uint,
+    active: bool
+  }
+)
+
+(define-map location-verifications
+  uint
+  {
+    verified-lat: int,
+    verified-lon: int,
+    geofence-validated: bool,
+    verification-timestamp: uint,
+    distance-from-target: uint
   }
 )
 
@@ -275,6 +330,155 @@
   )
 )
 
+(define-public (initialize-delivery-route (escrow-id uint) (start-lat int) (start-lon int) (end-lat int) (end-lon int))
+  (let (
+    (escrow (unwrap! (map-get? escrows escrow-id) ERR-NOT-FOUND))
+    (distance (calculate-distance start-lat start-lon end-lat end-lon))
+    (estimated-time (/ distance u60))
+  )
+    (asserts! (or (is-eq tx-sender (get merchant escrow)) (is-eq tx-sender CONTRACT-OWNER)) ERR-UNAUTHORIZED)
+    (asserts! (is-eq (get status escrow) STATUS-PENDING) ERR-INVALID-STATUS)
+    (asserts! (and (>= start-lat -900000000) (<= start-lat 900000000)) ERR-INVALID-COORDINATES)
+    (asserts! (and (>= start-lon -1800000000) (<= start-lon 1800000000)) ERR-INVALID-COORDINATES)
+    
+    (map-set delivery-routes escrow-id {
+      start-lat: start-lat,
+      start-lon: start-lon,
+      end-lat: end-lat,
+      end-lon: end-lon,
+      estimated-distance: distance,
+      estimated-time: estimated-time,
+      tracking-active: true,
+      waypoint-count: u0
+    })
+    
+    (var-set active-deliveries (+ (var-get active-deliveries) u1))
+    (ok true)
+  )
+)
+
+(define-public (update-drone-location (escrow-id uint) (latitude int) (longitude int) (altitude uint) (speed uint) (battery-level uint))
+  (let (
+    (escrow (unwrap! (map-get? escrows escrow-id) ERR-NOT-FOUND))
+    (route (unwrap! (map-get? delivery-routes escrow-id) ERR-ROUTE-NOT-FOUND))
+    (iot-device (unwrap! (get iot-device escrow) ERR-UNAUTHORIZED))
+    (current-waypoint-count (get waypoint-count route))
+    (new-waypoint-id (+ current-waypoint-count u1))
+  )
+    (asserts! (is-eq tx-sender iot-device) ERR-UNAUTHORIZED)
+    (asserts! (get tracking-active route) ERR-TRACKING-INACTIVE)
+    (asserts! (and (>= latitude -900000000) (<= latitude 900000000)) ERR-INVALID-COORDINATES)
+    (asserts! (and (>= longitude -1800000000) (<= longitude 1800000000)) ERR-INVALID-COORDINATES)
+    
+    (map-set tracking-waypoints {escrow-id: escrow-id, waypoint-id: new-waypoint-id} {
+      latitude: latitude,
+      longitude: longitude,
+      altitude: altitude,
+      timestamp: burn-block-height,
+      speed: speed,
+      battery-level: battery-level
+    })
+    
+    (map-set delivery-routes escrow-id (merge route {
+      waypoint-count: new-waypoint-id
+    }))
+    
+    (var-set total-waypoints (+ (var-get total-waypoints) u1))
+    (ok true)
+  )
+)
+
+(define-public (set-delivery-geofence (escrow-id uint) (center-lat int) (center-lon int) (radius-meters uint))
+  (let (
+    (escrow (unwrap! (map-get? escrows escrow-id) ERR-NOT-FOUND))
+  )
+    (asserts! (is-eq tx-sender (get customer escrow)) ERR-UNAUTHORIZED)
+    (asserts! (and (>= center-lat -900000000) (<= center-lat 900000000)) ERR-INVALID-COORDINATES)
+    (asserts! (and (>= center-lon -1800000000) (<= center-lon 1800000000)) ERR-INVALID-COORDINATES)
+    (asserts! (and (> radius-meters u0) (<= radius-meters u10000)) ERR-INVALID-COORDINATES)
+    
+    (map-set geofence-zones escrow-id {
+      center-lat: center-lat,
+      center-lon: center-lon,
+      radius-meters: radius-meters,
+      zone-type: u1,
+      active: true
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (verify-delivery-location (escrow-id uint) (delivery-lat int) (delivery-lon int))
+  (let (
+    (escrow (unwrap! (map-get? escrows escrow-id) ERR-NOT-FOUND))
+    (geofence (unwrap! (map-get? geofence-zones escrow-id) ERR-GEOFENCE-NOT-SET))
+    (iot-device (unwrap! (get iot-device escrow) ERR-UNAUTHORIZED))
+    (distance-from-center (calculate-distance delivery-lat delivery-lon (get center-lat geofence) (get center-lon geofence)))
+    (within-geofence (<= distance-from-center (get radius-meters geofence)))
+  )
+    (asserts! (is-eq tx-sender iot-device) ERR-UNAUTHORIZED)
+    (asserts! (get active geofence) ERR-GEOFENCE-NOT-SET)
+    (asserts! within-geofence ERR-OUTSIDE-GEOFENCE)
+    
+    (map-set location-verifications escrow-id {
+      verified-lat: delivery-lat,
+      verified-lon: delivery-lon,
+      geofence-validated: within-geofence,
+      verification-timestamp: burn-block-height,
+      distance-from-target: distance-from-center
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (confirm-delivery-with-location (escrow-id uint) (confirmation-hash (buff 32)) (delivery-lat int) (delivery-lon int))
+  (let (
+    (escrow (unwrap! (map-get? escrows escrow-id) ERR-NOT-FOUND))
+    (iot-device (unwrap! (get iot-device escrow) ERR-UNAUTHORIZED))
+  )
+    (asserts! (is-eq tx-sender iot-device) ERR-UNAUTHORIZED)
+    (asserts! (is-eq (get status escrow) STATUS-PENDING) ERR-ALREADY-CONFIRMED)
+    
+    (try! (verify-delivery-location escrow-id delivery-lat delivery-lon))
+    
+    (map-set escrows escrow-id (merge escrow {
+      status: STATUS-CONFIRMED,
+      confirmation-hash: (some confirmation-hash)
+    }))
+    
+    (let (
+      (device-data (default-to {authorized: false, escrows-confirmed: u0, reputation: u0} (map-get? iot-devices iot-device)))
+      (route (map-get? delivery-routes escrow-id))
+    )
+      (map-set iot-devices iot-device (merge device-data {
+        escrows-confirmed: (+ (get escrows-confirmed device-data) u1),
+        reputation: (+ (get reputation device-data) u15)
+      }))
+      
+      (match route
+        route-data (map-set delivery-routes escrow-id (merge route-data {tracking-active: false}))
+        true
+      )
+    )
+    
+    (var-set active-deliveries (- (var-get active-deliveries) u1))
+    (ok true)
+  )
+)
+
+(define-private (calculate-distance (lat1 int) (lon1 int) (lat2 int) (lon2 int))
+  (let (
+    (lat-diff (if (> lat1 lat2) (- lat1 lat2) (- lat2 lat1)))
+    (lon-diff (if (> lon1 lon2) (- lon1 lon2) (- lon2 lon1)))
+    (lat-factor (/ (to-uint (if (< lat-diff 0) (- lat-diff) lat-diff)) u111000))
+    (lon-factor (/ (to-uint (if (< lon-diff 0) (- lon-diff) lon-diff)) u111000))
+  )
+    (+ (* lat-factor lat-factor) (* lon-factor lon-factor))
+  )
+)
+
 (define-read-only (get-escrow (escrow-id uint))
   (map-get? escrows escrow-id)
 )
@@ -295,6 +499,8 @@
   {
     total-escrows: (var-get escrow-counter),
     total-escrowed: (var-get total-escrowed),
+    total-waypoints: (var-get total-waypoints),
+    active-deliveries: (var-get active-deliveries),
     contract-owner: CONTRACT-OWNER
   }
 )
@@ -310,5 +516,87 @@
   (match (map-get? escrows escrow-id)
     escrow (some (+ (get created-at escrow) ESCROW-TIMEOUT))
     none
+  )
+)
+
+(define-read-only (get-delivery-route (escrow-id uint))
+  (map-get? delivery-routes escrow-id)
+)
+
+(define-read-only (get-drone-waypoint (escrow-id uint) (waypoint-id uint))
+  (map-get? tracking-waypoints {escrow-id: escrow-id, waypoint-id: waypoint-id})
+)
+
+(define-read-only (get-latest-drone-location (escrow-id uint))
+  (match (map-get? delivery-routes escrow-id)
+    route (map-get? tracking-waypoints {escrow-id: escrow-id, waypoint-id: (get waypoint-count route)})
+    none
+  )
+)
+
+(define-read-only (get-geofence-zone (escrow-id uint))
+  (map-get? geofence-zones escrow-id)
+)
+
+(define-read-only (get-location-verification (escrow-id uint))
+  (map-get? location-verifications escrow-id)
+)
+
+(define-read-only (get-delivery-progress (escrow-id uint))
+  (match (map-get? delivery-routes escrow-id)
+    route {
+      route-initialized: true,
+      waypoints-recorded: (get waypoint-count route),
+      tracking-active: (get tracking-active route),
+      estimated-completion: (+ burn-block-height (get estimated-time route))
+    }
+    {
+      route-initialized: false,
+      waypoints-recorded: u0,
+      tracking-active: false,
+      estimated-completion: u0
+    }
+  )
+)
+
+(define-read-only (is-delivery-in-geofence (escrow-id uint) (lat int) (lon int))
+  (match (map-get? geofence-zones escrow-id)
+    geofence (let (
+      (distance (calculate-distance lat lon (get center-lat geofence) (get center-lon geofence)))
+    )
+      (<= distance (get radius-meters geofence))
+    )
+    false
+  )
+)
+
+(define-read-only (get-tracking-analytics (escrow-id uint))
+  (match (map-get? delivery-routes escrow-id)
+    route (match (get-latest-drone-location escrow-id)
+      latest-location {
+        total-waypoints: (get waypoint-count route),
+        current-battery: (get battery-level latest-location),
+        current-speed: (get speed latest-location),
+        current-altitude: (get altitude latest-location),
+        last-update: (get timestamp latest-location),
+        tracking-status: (get tracking-active route)
+      }
+      {
+        total-waypoints: (get waypoint-count route),
+        current-battery: u0,
+        current-speed: u0,
+        current-altitude: u0,
+        last-update: u0,
+        tracking-status: (get tracking-active route)
+      }
+    )
+    {
+      total-waypoints: u0,
+      current-battery: u0,
+      current-speed: u0,
+      current-altitude: u0,
+      last-update: u0,
+      tracking-status: false
+    }
   )
 )

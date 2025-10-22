@@ -19,6 +19,10 @@
 (define-constant ERR-ROUTE-NOT-FOUND (err u111))
 (define-constant ERR-TRACKING-INACTIVE (err u112))
 (define-constant ERR-GEOFENCE-NOT-SET (err u113))
+(define-constant ERR-INSURANCE-NOT-FOUND (err u114))
+(define-constant ERR-INSURANCE-ALREADY-PURCHASED (err u115))
+(define-constant ERR-CLAIM-ALREADY-PROCESSED (err u116))
+(define-constant ERR-INSURANCE-NOT-ELIGIBLE (err u117))
 
 (define-constant ESCROW-TIMEOUT u144)
 (define-constant DISPUTE-TIMEOUT u288)
@@ -33,6 +37,9 @@
 (define-data-var total-escrowed uint u0)
 (define-data-var total-waypoints uint u0)
 (define-data-var active-deliveries uint u0)
+(define-data-var insurance-pool uint u0)
+(define-data-var total-claims-paid uint u0)
+(define-data-var base-insurance-rate uint u50)
 
 (define-map escrows
   uint
@@ -123,6 +130,33 @@
     geofence-validated: bool,
     verification-timestamp: uint,
     distance-from-target: uint
+  }
+)
+
+(define-map delivery-insurance
+  uint
+  {
+    insured: bool,
+    premium-paid: uint,
+    coverage-amount: uint,
+    risk-score: uint,
+    purchased-at: uint,
+    claim-filed: bool,
+    claim-approved: bool,
+    claim-amount: uint,
+    claim-processed-at: (optional uint)
+  }
+)
+
+(define-map insurance-policies
+  uint
+  {
+    policy-id: uint,
+    distance-factor: uint,
+    value-factor: uint,
+    reputation-factor: uint,
+    final-premium: uint,
+    created-at: uint
   }
 )
 
@@ -468,6 +502,185 @@
   )
 )
 
+(define-public (purchase-delivery-insurance (escrow-id uint))
+  (let (
+    (escrow (unwrap! (map-get? escrows escrow-id) ERR-NOT-FOUND))
+    (existing-insurance (map-get? delivery-insurance escrow-id))
+    (route (map-get? delivery-routes escrow-id))
+    (merchant-data (map-get? merchant-profiles (get merchant escrow)))
+    (premium (calculate-insurance-premium escrow-id))
+  )
+    (asserts! (is-eq tx-sender (get customer escrow)) ERR-UNAUTHORIZED)
+    (asserts! (is-eq (get status escrow) STATUS-PENDING) ERR-INVALID-STATUS)
+    (asserts! (is-none existing-insurance) ERR-INSURANCE-ALREADY-PURCHASED)
+    (asserts! (> premium u0) ERR-INVALID-ESCROW)
+    
+    (try! (stx-transfer? premium tx-sender (as-contract tx-sender)))
+    
+    (let (
+      (coverage (get amount escrow))
+      (risk (calculate-risk-score route merchant-data (get amount escrow)))
+    )
+      (map-set delivery-insurance escrow-id {
+        insured: true,
+        premium-paid: premium,
+        coverage-amount: coverage,
+        risk-score: risk,
+        purchased-at: burn-block-height,
+        claim-filed: false,
+        claim-approved: false,
+        claim-amount: u0,
+        claim-processed-at: none
+      })
+      
+      (var-set insurance-pool (+ (var-get insurance-pool) premium))
+      (ok premium)
+    )
+  )
+)
+
+(define-public (file-insurance-claim (escrow-id uint))
+  (let (
+    (escrow (unwrap! (map-get? escrows escrow-id) ERR-NOT-FOUND))
+    (insurance (unwrap! (map-get? delivery-insurance escrow-id) ERR-INSURANCE-NOT-FOUND))
+  )
+    (asserts! (is-eq tx-sender (get customer escrow)) ERR-UNAUTHORIZED)
+    (asserts! (get insured insurance) ERR-INSURANCE-NOT-ELIGIBLE)
+    (asserts! (not (get claim-filed insurance)) ERR-CLAIM-ALREADY-PROCESSED)
+    (asserts! (or 
+      (is-eq (get status escrow) STATUS-DISPUTED)
+      (and (is-eq (get status escrow) STATUS-PENDING) (>= burn-block-height (+ (get created-at escrow) ESCROW-TIMEOUT)))
+    ) ERR-INSURANCE-NOT-ELIGIBLE)
+    
+    (map-set delivery-insurance escrow-id (merge insurance {
+      claim-filed: true
+    }))
+    
+    (ok true)
+  )
+)
+
+(define-public (process-insurance-claim (escrow-id uint) (approved bool))
+  (let (
+    (escrow (unwrap! (map-get? escrows escrow-id) ERR-NOT-FOUND))
+    (insurance (unwrap! (map-get? delivery-insurance escrow-id) ERR-INSURANCE-NOT-FOUND))
+  )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (asserts! (get claim-filed insurance) ERR-INSURANCE-NOT-FOUND)
+    (asserts! (is-none (get claim-processed-at insurance)) ERR-CLAIM-ALREADY-PROCESSED)
+    
+    (if approved
+      (let (
+        (payout (get coverage-amount insurance))
+      )
+        (asserts! (>= (var-get insurance-pool) payout) ERR-INSUFFICIENT-FUNDS)
+        (try! (as-contract (stx-transfer? payout tx-sender (get customer escrow))))
+        
+        (map-set delivery-insurance escrow-id (merge insurance {
+          claim-approved: true,
+          claim-amount: payout,
+          claim-processed-at: (some burn-block-height)
+        }))
+        
+        (var-set insurance-pool (- (var-get insurance-pool) payout))
+        (var-set total-claims-paid (+ (var-get total-claims-paid) payout))
+        (ok payout)
+      )
+      (begin
+        (map-set delivery-insurance escrow-id (merge insurance {
+          claim-approved: false,
+          claim-processed-at: (some burn-block-height)
+        }))
+        (ok u0)
+      )
+    )
+  )
+)
+
+(define-public (update-base-insurance-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (asserts! (and (>= new-rate u10) (<= new-rate u200)) ERR-INVALID-ESCROW)
+    (var-set base-insurance-rate new-rate)
+    (ok new-rate)
+  )
+)
+
+(define-private (calculate-insurance-premium (escrow-id uint))
+  (let (
+    (escrow (unwrap! (map-get? escrows escrow-id) u0))
+    (route (map-get? delivery-routes escrow-id))
+    (merchant-data (map-get? merchant-profiles (get merchant escrow)))
+    (base-rate (var-get base-insurance-rate))
+  )
+    (match route
+      route-data
+        (let (
+          (distance-factor (calculate-distance-factor (get estimated-distance route-data)))
+          (value-factor (calculate-value-factor (get amount escrow)))
+          (reputation-factor (calculate-reputation-factor merchant-data))
+          (total-factor (+ (+ distance-factor value-factor) reputation-factor))
+        )
+          (/ (* (get amount escrow) (* base-rate total-factor)) u100000)
+        )
+      (/ (* (get amount escrow) base-rate) u1000)
+    )
+  )
+)
+
+(define-private (calculate-risk-score (route (optional {start-lat: int, start-lon: int, end-lat: int, end-lon: int, estimated-distance: uint, estimated-time: uint, tracking-active: bool, waypoint-count: uint})) (merchant (optional {name: (string-ascii 50), verified: bool, total-deliveries: uint, success-rate: uint})) (amount uint))
+  (let (
+    (distance-risk (match route r (/ (get estimated-distance r) u1000) u50))
+    (value-risk (/ amount u10000))
+    (merchant-risk (match merchant m (if (get verified m) u10 u30) u50))
+  )
+    (+ (+ distance-risk value-risk) merchant-risk)
+  )
+)
+
+(define-private (calculate-distance-factor (distance uint))
+  (if (<= distance u5000)
+    u100
+    (if (<= distance u15000)
+      u150
+      (if (<= distance u30000)
+        u200
+        u300
+      )
+    )
+  )
+)
+
+(define-private (calculate-value-factor (amount uint))
+  (if (<= amount u1000000)
+    u100
+    (if (<= amount u5000000)
+      u120
+      (if (<= amount u10000000)
+        u150
+        u200
+      )
+    )
+  )
+)
+
+(define-private (calculate-reputation-factor (merchant-data (optional {name: (string-ascii 50), verified: bool, total-deliveries: uint, success-rate: uint})))
+  (match merchant-data
+    merchant
+      (if (get verified merchant)
+        (if (>= (get success-rate merchant) u95)
+          u80
+          (if (>= (get success-rate merchant) u85)
+            u100
+            u120
+          )
+        )
+        u150
+      )
+    u150
+  )
+)
+
 (define-private (calculate-distance (lat1 int) (lon1 int) (lat2 int) (lon2 int))
   (let (
     (lat-diff (if (> lat1 lat2) (- lat1 lat2) (- lat2 lat1)))
@@ -501,6 +714,9 @@
     total-escrowed: (var-get total-escrowed),
     total-waypoints: (var-get total-waypoints),
     active-deliveries: (var-get active-deliveries),
+    insurance-pool: (var-get insurance-pool),
+    total-claims-paid: (var-get total-claims-paid),
+    base-insurance-rate: (var-get base-insurance-rate),
     contract-owner: CONTRACT-OWNER
   }
 )
@@ -598,5 +814,32 @@
       last-update: u0,
       tracking-status: false
     }
+  )
+)
+
+(define-read-only (get-delivery-insurance (escrow-id uint))
+  (map-get? delivery-insurance escrow-id)
+)
+
+(define-read-only (calculate-insurance-quote (escrow-id uint))
+  (ok (calculate-insurance-premium escrow-id))
+)
+
+(define-read-only (get-insurance-statistics)
+  {
+    total-pool: (var-get insurance-pool),
+    total-claims-paid: (var-get total-claims-paid),
+    base-rate: (var-get base-insurance-rate),
+    pool-utilization: (if (> (var-get insurance-pool) u0)
+      (/ (* (var-get total-claims-paid) u100) (+ (var-get insurance-pool) (var-get total-claims-paid)))
+      u0
+    )
+  }
+)
+
+(define-read-only (is-delivery-insured (escrow-id uint))
+  (match (map-get? delivery-insurance escrow-id)
+    insurance (get insured insurance)
+    false
   )
 )
